@@ -13,11 +13,10 @@
  *   1. Poll SDL2 events (keyboard, mouse, resize, quit)
  *   2. Read PTY output for every pane in every tab
  *   3. Compute pane layout (pixel rects)
- *   4. Render the active tab's pane tree
- *
- * This stage switches tabs over to pane-backed roots but still
- * behaves like a single focused terminal per tab. Pane splitting
- * and pane focus controls are added later.
+ *   4. Render tab bar
+ *   5. Render all leaf panes of the active tab
+ *   6. Draw pane dividers + focus border
+ *   7. Draw cursor + scroll indicator
  */
 
 #include <stdio.h>
@@ -228,10 +227,20 @@ int main(void) {
                 int mx = event.button.x;
                 int my = event.button.y;
 
-                /* Only the tab bar is interactive at this stage */
+                /* Tab bar click? */
                 if (my < TAB_BAR_HEIGHT) {
                     if (tabs_handle_click(&tm, mx, my, cols, rows)) {
                         tab = tabs_get_active(&tm);
+                    }
+                } else {
+                    /*
+                     * Click inside terminal area — focus the pane
+                     * that was clicked. pane_find_at searches the
+                     * tree by pixel position.
+                     */
+                    Pane *clicked = pane_find_at(tab->root, mx, my);
+                    if (clicked) {
+                        pane_set_focus(tab->root, clicked);
                     }
                 }
                 continue;
@@ -314,6 +323,65 @@ int main(void) {
                     sym >= SDLK_1 && sym <= SDLK_9) {
                     tabs_set_active(&tm, sym - SDLK_1);
                     tab = tabs_get_active(&tm);
+                    continue;
+                }
+
+                /* ══ PANE SHORTCUTS ═════════════════════════════ */
+
+                /* Ctrl+Shift+Right — split focused pane horizontally */
+                if (ctrl && shift && sym == SDLK_RIGHT) {
+                    Pane *fp = pane_get_focused(tab->root);
+                    if (fp) {
+                        /*
+                         * pane_split replaces the leaf with a split
+                         * node. If fp is the root, we replace the root.
+                         * For deeper panes we need parent tracking —
+                         * for now we replace root in all cases via
+                         * the return value.
+                         */
+                        Pane *new_node = pane_split(fp,
+                                             PANE_SPLIT_H,
+                                             cols, rows);
+                        if (new_node != fp) {
+                            /*
+                             * fp was the root leaf. Replace root.
+                             * For non-root splits the tree is updated
+                             * inside pane_split via pointer rewriting.
+                             */
+                            tab->root = new_node;
+                        }
+                    }
+                    continue;
+                }
+
+                /* Ctrl+Shift+Down — split focused pane vertically */
+                if (ctrl && shift && sym == SDLK_DOWN) {
+                    Pane *fp = pane_get_focused(tab->root);
+                    if (fp) {
+                        Pane *new_node = pane_split(fp,
+                                             PANE_SPLIT_V,
+                                             cols, rows);
+                        if (new_node != fp) {
+                            tab->root = new_node;
+                        }
+                    }
+                    continue;
+                }
+
+                /* Ctrl+Shift+W — close focused pane */
+                if (ctrl && shift && sym == SDLK_w) {
+                    tab->root = pane_close_focused(tab->root);
+                    if (!tab->root) {
+                        /* All panes in this tab are gone */
+                        tabs_close(&tm, tm.active);
+                        tab = tabs_get_active(&tm);
+                    }
+                    continue;
+                }
+
+                /* Ctrl+Shift+F — cycle focus between panes */
+                if (ctrl && shift && sym == SDLK_f) {
+                    pane_focus_next(tab->root);
                     continue;
                 }
 
@@ -427,6 +495,9 @@ int main(void) {
 
         /* ── 3c. Render all leaf panes ── */
         render_pane_tree(tab->root, win.renderer, &font);
+
+        /* ── 3d. Draw dividers + focus border ── */
+        pane_draw_dividers(tab->root, win.renderer);
 
         window_render_end(&win);
 
