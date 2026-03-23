@@ -18,6 +18,7 @@ add_executable(cterm
     src/font.c
     src/pty.c
     src/ansi.c
+    src/tabs.c
 )
 
 target_link_libraries(cterm
