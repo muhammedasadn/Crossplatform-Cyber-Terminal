@@ -17,11 +17,12 @@ add_executable(cterm
     src/window.c
     src/font.c
     src/pty.c
+    src/ansi.c
 )
 
 target_link_libraries(cterm
     ${SDL2_LIBRARIES}
     ${FREETYPE_LIBRARIES}
-    util    # contains openpty() on Linux
+    util
     m
 )
