@@ -1,19 +1,19 @@
-# Minimum CMake version required
 cmake_minimum_required(VERSION 3.16)
-
-# Project name and language
 project(cterm C)
 
-# Use the C99 standard
-# C99 added many useful features we'll need later
 set(CMAKE_C_STANDARD 99)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
-# Tell CMake where our header files live
 include_directories(include)
 
-# Define what we're building:
-# an executable named "cterm" built from src/main.c
+# Ask pkg-config where SDL2 is installed on this system
+find_package(SDL2 REQUIRED)
+include_directories(${SDL2_INCLUDE_DIRS})
+
 add_executable(cterm
     src/main.c
+    src/window.c
 )
+
+# Link against SDL2 — this tells the linker to include SDL2's code
+target_link_libraries(cterm ${SDL2_LIBRARIES})
