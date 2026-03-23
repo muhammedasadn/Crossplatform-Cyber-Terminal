@@ -1,12 +1,23 @@
 /*
- * main.c — cterm with working tab support.
+ * main.c — cterm entry point.
  *
- * Key fix: SDL_TEXTINPUT fires for printable characters.
- * SDL_KEYDOWN fires for ALL keys including Ctrl combos.
- * When Ctrl is held, SDL_TEXTINPUT does NOT fire — only
- * SDL_KEYDOWN fires. So all Ctrl+key logic lives in
- * SDL_KEYDOWN only, and we check tab shortcuts FIRST
- * before the generic Ctrl+letter handler.
+ * Wires all modules together:
+ *   window   → SDL2 window + GPU renderer
+ *   font     → FreeType glyph cache
+ *   tabs     → tab bar + TabManager
+ *   pane     → split pane tree per tab
+ *   ansi     → ANSI/VT100 parser + cell grid
+ *   pty      → shell process (one per leaf pane)
+ *
+ * Main loop each frame:
+ *   1. Poll SDL2 events (keyboard, mouse, resize, quit)
+ *   2. Read PTY output for every pane in every tab
+ *   3. Compute pane layout (pixel rects)
+ *   4. Render the active tab's pane tree
+ *
+ * This stage switches tabs over to pane-backed roots but still
+ * behaves like a single focused terminal per tab. Pane splitting
+ * and pane focus controls are added later.
  */
 
 #include <stdio.h>
@@ -15,27 +26,158 @@
 #include "window.h"
 #include "font.h"
 #include "tabs.h"
+#include "pane.h"
 #include "ansi.h"
+
+
+/* ── render_pane_tree ───────────────────────────────────────── */
+
+/*
+ * Recursively renders every leaf pane in the tree.
+ *
+ * For PANE_LEAF:
+ *   - Recomputes cols/rows from the pane's pixel rect.
+ *   - Calls terminal_resize + pty_resize if dimensions changed.
+ *   - Draws background rects and character glyphs for every cell.
+ *   - Draws the blinking cursor if this pane is focused.
+ *
+ * For PANE_SPLIT:
+ *   - Recurses into first and second children.
+ *
+ * Called once per frame after pane_layout() has computed rects.
+ */
+static void render_pane_tree(Pane *p, SDL_Renderer *renderer,
+                             Font *font) {
+    if (!p) return;
+
+    if (p->type != PANE_LEAF) {
+        /* Split node — recurse into both children */
+        render_pane_tree(p->first,  renderer, font);
+        render_pane_tree(p->second, renderer, font);
+        return;
+    }
+
+    /* ── Leaf pane ── */
+    Terminal *term  = p->term;
+    SDL_Rect  r     = p->rect;
+
+    /* Skip degenerate rects */
+    if (r.w < font->cell_width || r.h < font->cell_height) return;
+
+    /* Recompute grid dimensions from pixel rect */
+    int pcols = r.w / font->cell_width;
+    int prows = r.h / font->cell_height;
+    if (pcols < 1) pcols = 1;
+    if (prows < 1) prows = 1;
+
+    /* Resize terminal + PTY if the pane size changed */
+    if (pcols != term->cols || prows != term->rows) {
+        terminal_resize(term, pcols, prows);
+        pty_resize(&p->pty, pcols, prows);
+    }
+
+    /* ── Draw each cell ── */
+    for (int row = 0; row < term->rows; row++) {
+        Cell *display_row = terminal_get_display_row(term, row);
+
+        for (int col = 0; col < term->cols; col++) {
+            int x = r.x + col * font->cell_width;
+            int y = r.y + row * font->cell_height;
+
+            /* Skip cells that would draw outside the pane rect */
+            if (x + font->cell_width  > r.x + r.w) continue;
+            if (y + font->cell_height > r.y + r.h) continue;
+
+            Uint8 bg_r = 0,   bg_g = 0,   bg_b = 0;
+            Uint8 fg_r = 200, fg_g = 200, fg_b = 200;
+            char  ch   = ' ';
+
+            if (display_row) {
+                ch   = display_row[col].ch;
+                fg_r = display_row[col].fg.r;
+                fg_g = display_row[col].fg.g;
+                fg_b = display_row[col].fg.b;
+                bg_r = display_row[col].bg.r;
+                bg_g = display_row[col].bg.g;
+                bg_b = display_row[col].bg.b;
+            }
+
+            /* Cell background */
+            SDL_SetRenderDrawColor(renderer, bg_r, bg_g, bg_b, 255);
+            SDL_Rect bg_rect = {x, y, font->cell_width, font->cell_height};
+            SDL_RenderFillRect(renderer, &bg_rect);
+
+            /* Character glyph */
+            if (ch != ' ' && ch != '\0') {
+                font_draw_char(font, renderer, ch, x, y,
+                               fg_r, fg_g, fg_b);
+            }
+        }
+    }
+
+    /* ── Blinking cursor (focused pane, live view only) ── */
+    if (p->focused && term->scroll_offset == 0) {
+        Uint32 ticks = SDL_GetTicks();
+        if ((ticks / 500) % 2 == 0) {
+            SDL_SetRenderDrawColor(renderer, 220, 220, 220, 200);
+            SDL_Rect cur = {
+                r.x + term->cursor_col * font->cell_width,
+                r.y + term->cursor_row * font->cell_height,
+                font->cell_width,
+                font->cell_height
+            };
+            SDL_RenderFillRect(renderer, &cur);
+        }
+    }
+
+    /* ── Scroll indicator (focused pane, scrolled view) ── */
+    if (p->focused && term->scroll_offset > 0) {
+        /* Blue line at top of pane */
+        SDL_SetRenderDrawColor(renderer, 80, 140, 255, 220);
+        SDL_Rect top_line = {r.x, r.y, r.w, 2};
+        SDL_RenderFillRect(renderer, &top_line);
+
+        /* Proportional scroll bar on right edge */
+        if (term->sb_count > 0) {
+            float ratio = (float)term->scroll_offset
+                          / (float)term->sb_count;
+            int bar_h   = r.h / 8;
+            int bar_y   = r.y + (int)((r.h - bar_h) * (1.0f - ratio));
+            SDL_SetRenderDrawColor(renderer, 80, 140, 255, 160);
+            SDL_Rect bar = {r.x + r.w - 4, bar_y, 4, bar_h};
+            SDL_RenderFillRect(renderer, &bar);
+        }
+    }
+}
+
+
+/* ════════════════════════════════════════════════════════════
+ * main
+ * ════════════════════════════════════════════════════════════ */
 
 int main(void) {
     Window     win;
     Font       font;
     TabManager tm;
 
+    /* ── Window ──────────────────────────────────────────────── */
     if (window_init(&win, 900, 550) != 0) {
         fprintf(stderr, "Failed to create window.\n");
         return 1;
     }
 
+    /* ── Font ────────────────────────────────────────────────── */
     if (font_init(&font, win.renderer, "../assets/font.ttf", 16) != 0) {
         fprintf(stderr, "Failed to load font.\n");
         window_destroy(&win);
         return 1;
     }
 
+    /* ── Initial grid dimensions ─────────────────────────────── */
     int cols = win.width  / font.cell_width;
     int rows = (win.height - TAB_BAR_HEIGHT) / font.cell_height;
 
+    /* ── Tab manager — opens first tab + bash ────────────────── */
     if (tabs_init(&tm, cols, rows) != 0) {
         fprintf(stderr, "Failed to init tabs.\n");
         font_destroy(&font);
@@ -46,14 +188,15 @@ int main(void) {
     char read_buf[4096];
     int  running = 1;
 
+    /* ════════════════════════════════════════════════════════════
+     * MAIN LOOP
+     * ════════════════════════════════════════════════════════════ */
     while (running) {
 
-        /* Always get fresh pointers at top of loop */
-        Tab      *tab  = tabs_get_active(&tm);
-        Terminal *term = tab->term;
-        PTY      *pty  = &tab->pty;
+        /* ── Refresh active tab pointer each frame ───────────── */
+        Tab  *tab = tabs_get_active(&tm);
 
-        /* ── Event loop ──────────────────────────────────────── */
+        /* ── 1. EVENT HANDLING ───────────────────────────────── */
         SDL_Event event;
         while (SDL_PollEvent(&event)) {
 
@@ -68,61 +211,66 @@ int main(void) {
                 event.window.event == SDL_WINDOWEVENT_RESIZED) {
                 win.width  = event.window.data1;
                 win.height = event.window.data2;
-                int nc = win.width  / font.cell_width;
-                int nr = (win.height - TAB_BAR_HEIGHT)
-                         / font.cell_height;
-                for (int i = 0; i < tm.count; i++) {
-                    terminal_resize(tm.tabs[i].term, nc, nr);
-                    pty_resize(&tm.tabs[i].pty, nc, nr);
-                }
-                cols = nc;
-                rows = nr;
+                cols = win.width  / font.cell_width;
+                rows = (win.height - TAB_BAR_HEIGHT)
+                       / font.cell_height;
+                /*
+                 * Resize happens in render_pane_tree automatically
+                 * when leaf pane rects change. No explicit call needed.
+                 */
                 continue;
             }
 
-            /* ── Mouse button — tab bar clicks ── */
+            /* ── Mouse button ── */
             if (event.type == SDL_MOUSEBUTTONDOWN &&
                 event.button.button == SDL_BUTTON_LEFT) {
-                if (tabs_handle_click(&tm,
-                                      event.button.x,
-                                      event.button.y,
-                                      cols, rows)) {
-                    /* Click was inside tab bar — refresh pointers */
-                    tab  = tabs_get_active(&tm);
-                    term = tab->term;
-                    pty  = &tab->pty;
+
+                int mx = event.button.x;
+                int my = event.button.y;
+
+                /* Only the tab bar is interactive at this stage */
+                if (my < TAB_BAR_HEIGHT) {
+                    if (tabs_handle_click(&tm, mx, my, cols, rows)) {
+                        tab = tabs_get_active(&tm);
+                    }
                 }
                 continue;
             }
 
-            /* ── Mouse wheel — scrollback ── */
+            /* ── Mouse wheel — scrollback on focused pane ── */
             if (event.type == SDL_MOUSEWHEEL) {
-                if (event.wheel.y > 0) {
-                    term->scroll_offset += 3;
-                    if (term->scroll_offset > term->sb_count)
-                        term->scroll_offset = term->sb_count;
-                } else if (event.wheel.y < 0) {
-                    term->scroll_offset -= 3;
-                    if (term->scroll_offset < 0)
-                        term->scroll_offset = 0;
+                Pane *fp = pane_get_focused(tab->root);
+                if (fp && fp->term) {
+                    if (event.wheel.y > 0) {
+                        fp->term->scroll_offset += 3;
+                        if (fp->term->scroll_offset > fp->term->sb_count)
+                            fp->term->scroll_offset = fp->term->sb_count;
+                    } else if (event.wheel.y < 0) {
+                        fp->term->scroll_offset -= 3;
+                        if (fp->term->scroll_offset < 0)
+                            fp->term->scroll_offset = 0;
+                    }
                 }
                 continue;
             }
 
             /* ── Text input — printable characters ── */
             /*
-             * SDL_TEXTINPUT fires ONLY for printable chars.
-             * It does NOT fire when Ctrl/Alt is held.
-             * So this block never interferes with Ctrl+T etc.
+             * SDL_TEXTINPUT fires ONLY for printable characters.
+             * It never fires when Ctrl or Alt is held, so it cannot
+             * interfere with Ctrl+T, Ctrl+W, etc.
              */
             if (event.type == SDL_TEXTINPUT) {
-                term->scroll_offset = 0;
-                pty_write(pty, event.text.text,
-                          strlen(event.text.text));
+                Pane *fp = pane_get_focused(tab->root);
+                if (fp) {
+                    fp->term->scroll_offset = 0;
+                    pty_write(&fp->pty, event.text.text,
+                              strlen(event.text.text));
+                }
                 continue;
             }
 
-            /* ── Key down — special keys and Ctrl combos ── */
+            /* ── Key down — Ctrl combos + special keys ── */
             if (event.type == SDL_KEYDOWN) {
                 SDL_Keycode sym = event.key.keysym.sym;
                 SDL_Keymod  mod = SDL_GetModState();
@@ -130,217 +278,162 @@ int main(void) {
                 int ctrl  = (mod & KMOD_CTRL)  != 0;
                 int shift = (mod & KMOD_SHIFT) != 0;
 
-                /*
-                 * TAB SHORTCUTS — must be checked before the
-                 * generic Ctrl+letter handler below.
-                 * Each one refreshes tab/term/pty after switching.
-                 */
-                if (ctrl && sym == SDLK_t) {
-                    /* Ctrl+T — open new tab */
-                    printf("DEBUG: Ctrl+T pressed, opening new tab\n");
-                    fflush(stdout);
+                /* ══ TAB SHORTCUTS ══════════════════════════════ */
+                /* Checked BEFORE generic Ctrl+letter handler.     */
+
+                /* Ctrl+T — new tab */
+                if (ctrl && !shift && sym == SDLK_t) {
                     tabs_new(&tm, cols, rows);
-                    tab  = tabs_get_active(&tm);
-                    term = tab->term;
-                    pty  = &tab->pty;
+                    tab = tabs_get_active(&tm);
                     continue;
                 }
 
-                if (ctrl && sym == SDLK_w) {
-                    /* Ctrl+W — close current tab */
+                /* Ctrl+W — close current tab */
+                if (ctrl && !shift && sym == SDLK_w) {
                     tabs_close(&tm, tm.active);
-                    tab  = tabs_get_active(&tm);
-                    term = tab->term;
-                    pty  = &tab->pty;
+                    tab = tabs_get_active(&tm);
                     continue;
                 }
 
-                if (ctrl && sym == SDLK_TAB) {
-                    /* Ctrl+Tab / Ctrl+Shift+Tab */
-                    if (shift) tabs_prev(&tm);
-                    else       tabs_next(&tm);
-                    tab  = tabs_get_active(&tm);
-                    term = tab->term;
-                    pty  = &tab->pty;
+                /* Ctrl+Tab — next tab */
+                if (ctrl && !shift && sym == SDLK_TAB) {
+                    tabs_next(&tm);
+                    tab = tabs_get_active(&tm);
                     continue;
                 }
 
-                if (ctrl && sym >= SDLK_1 && sym <= SDLK_9) {
-                    /* Ctrl+1 through Ctrl+9 — jump to tab */
+                /* Ctrl+Shift+Tab — previous tab */
+                if (ctrl && shift && sym == SDLK_TAB) {
+                    tabs_prev(&tm);
+                    tab = tabs_get_active(&tm);
+                    continue;
+                }
+
+                /* Ctrl+1 through Ctrl+9 — jump to tab N */
+                if (ctrl && !shift &&
+                    sym >= SDLK_1 && sym <= SDLK_9) {
                     tabs_set_active(&tm, sym - SDLK_1);
-                    tab  = tabs_get_active(&tm);
-                    term = tab->term;
-                    pty  = &tab->pty;
+                    tab = tabs_get_active(&tm);
                     continue;
                 }
 
-                /*
-                 * GENERIC Ctrl+letter — send control byte to shell.
-                 * Reached only if NOT a tab shortcut above.
-                 * Ctrl+A=0x01, Ctrl+B=0x02, ..., Ctrl+Z=0x1A
-                 */
+                /* ══ GENERIC Ctrl+letter ════════════════════════ */
+                /* Only reached if NOT a tab/pane shortcut above.  */
                 if (ctrl && sym >= SDLK_a && sym <= SDLK_z) {
-                    char ctrl_char = (char)(sym - SDLK_a + 1);
-                    pty_write(pty, &ctrl_char, 1);
+                    Pane *fp = pane_get_focused(tab->root);
+                    if (fp) {
+                        char ctrl_char = (char)(sym - SDLK_a + 1);
+                        pty_write(&fp->pty, &ctrl_char, 1);
+                    }
                     continue;
                 }
 
-                /*
-                 * TERMINAL KEYS — arrow keys, Enter, Backspace etc.
-                 * These only fire when Ctrl is NOT held (printable
-                 * chars are handled by SDL_TEXTINPUT above).
-                 */
-                switch (sym) {
-                    case SDLK_RETURN:
-                        term->scroll_offset = 0;
-                        pty_write(pty, "\r", 1);
-                        break;
-                    case SDLK_BACKSPACE:
-                        pty_write(pty, "\x7f", 1);
-                        break;
-                    case SDLK_TAB:
-                        pty_write(pty, "\t", 1);
-                        break;
-                    case SDLK_ESCAPE:
-                        pty_write(pty, "\x1b", 1);
-                        break;
-                    case SDLK_UP:
-                        pty_write(pty, "\x1b[A", 3);
-                        break;
-                    case SDLK_DOWN:
-                        pty_write(pty, "\x1b[B", 3);
-                        break;
-                    case SDLK_RIGHT:
-                        pty_write(pty, "\x1b[C", 3);
-                        break;
-                    case SDLK_LEFT:
-                        pty_write(pty, "\x1b[D", 3);
-                        break;
-                    case SDLK_HOME:
-                        pty_write(pty, "\x1b[H", 3);
-                        break;
-                    case SDLK_END:
-                        pty_write(pty, "\x1b[F", 3);
-                        break;
-                    case SDLK_DELETE:
-                        pty_write(pty, "\x1b[3~", 4);
-                        break;
-                    case SDLK_PAGEUP:
-                        term->scroll_offset += rows / 2;
-                        if (term->scroll_offset > term->sb_count)
-                            term->scroll_offset = term->sb_count;
-                        break;
-                    case SDLK_PAGEDOWN:
-                        term->scroll_offset -= rows / 2;
-                        if (term->scroll_offset < 0)
-                            term->scroll_offset = 0;
-                        break;
-                    default:
-                        break;
+                /* ══ TERMINAL KEYS ══════════════════════════════ */
+                {
+                    Pane *fp = pane_get_focused(tab->root);
+                    if (!fp) continue;
+
+                    PTY      *pty  = &fp->pty;
+                    Terminal *term_fp = fp->term;
+
+                    switch (sym) {
+                        case SDLK_RETURN:
+                            term_fp->scroll_offset = 0;
+                            pty_write(pty, "\r", 1);
+                            break;
+                        case SDLK_BACKSPACE:
+                            pty_write(pty, "\x7f", 1);
+                            break;
+                        case SDLK_TAB:
+                            pty_write(pty, "\t", 1);
+                            break;
+                        case SDLK_ESCAPE:
+                            pty_write(pty, "\x1b", 1);
+                            break;
+                        case SDLK_UP:
+                            pty_write(pty, "\x1b[A", 3);
+                            break;
+                        case SDLK_DOWN:
+                            pty_write(pty, "\x1b[B", 3);
+                            break;
+                        case SDLK_RIGHT:
+                            pty_write(pty, "\x1b[C", 3);
+                            break;
+                        case SDLK_LEFT:
+                            pty_write(pty, "\x1b[D", 3);
+                            break;
+                        case SDLK_HOME:
+                            pty_write(pty, "\x1b[H", 3);
+                            break;
+                        case SDLK_END:
+                            pty_write(pty, "\x1b[F", 3);
+                            break;
+                        case SDLK_DELETE:
+                            pty_write(pty, "\x1b[3~", 4);
+                            break;
+                        case SDLK_PAGEUP:
+                            term_fp->scroll_offset += rows / 2;
+                            if (term_fp->scroll_offset > term_fp->sb_count)
+                                term_fp->scroll_offset = term_fp->sb_count;
+                            break;
+                        case SDLK_PAGEDOWN:
+                            term_fp->scroll_offset -= rows / 2;
+                            if (term_fp->scroll_offset < 0)
+                                term_fp->scroll_offset = 0;
+                            break;
+                        default:
+                            break;
+                    }
                 }
                 continue;
-            }
+
+            } /* end SDL_KEYDOWN */
 
         } /* end SDL_PollEvent */
 
 
-        /* ── Read PTY output for ALL tabs ────────────────────── */
+        /* ── 2. READ PTY OUTPUT ──────────────────────────────── */
+        /*
+         * Read from every pane in every tab every frame.
+         * Background tabs keep running — their output is parsed
+         * silently into their grids. Switching to them shows
+         * up-to-date content immediately.
+         */
         for (int i = 0; i < tm.count; i++) {
-            int n = pty_read(&tm.tabs[i].pty,
-                             read_buf, sizeof(read_buf));
-            if (n > 0) {
-                terminal_process(tm.tabs[i].term, read_buf, n);
-            }
+            pane_read_all(tm.tabs[i].root, read_buf, sizeof(read_buf));
         }
 
 
-        /* ── Render ──────────────────────────────────────────── */
+        /* ── 3. RENDER ───────────────────────────────────────── */
         window_render_begin(&win);
 
-        /* Tab bar */
+        /* ── 3a. Tab bar ── */
         tabs_draw_bar(&tm, win.renderer, &font, win.width);
 
-        /* Active terminal grid */
-        tab  = tabs_get_active(&tm);
-        term = tab->term;
+        /* ── 3b. Compute pane layout ── */
+        /*
+         * pane_layout() recursively fills every pane's rect field
+         * based on the available terminal area (below the tab bar).
+         * Must be called before rendering so rects are current.
+         */
+        tab = tabs_get_active(&tm);
+        SDL_Rect terminal_area = {
+            0,
+            TAB_BAR_HEIGHT,
+            win.width,
+            win.height - TAB_BAR_HEIGHT
+        };
+        pane_layout(tab->root, terminal_area);
 
-        for (int row = 0; row < term->rows; row++) {
-            Cell *display_row = terminal_get_display_row(term, row);
-
-            for (int col = 0; col < term->cols; col++) {
-                int x = col * font.cell_width;
-                int y = row * font.cell_height + TAB_BAR_HEIGHT;
-
-                Uint8 bg_r = 0,   bg_g = 0,   bg_b = 0;
-                Uint8 fg_r = 200, fg_g = 200, fg_b = 200;
-                char  ch   = ' ';
-
-                if (display_row) {
-                    ch   = display_row[col].ch;
-                    fg_r = display_row[col].fg.r;
-                    fg_g = display_row[col].fg.g;
-                    fg_b = display_row[col].fg.b;
-                    bg_r = display_row[col].bg.r;
-                    bg_g = display_row[col].bg.g;
-                    bg_b = display_row[col].bg.b;
-                }
-
-                SDL_SetRenderDrawColor(win.renderer,
-                                       bg_r, bg_g, bg_b, 255);
-                SDL_Rect bg_rect = {x, y,
-                                    font.cell_width,
-                                    font.cell_height};
-                SDL_RenderFillRect(win.renderer, &bg_rect);
-
-                if (ch != ' ' && ch != '\0') {
-                    font_draw_char(&font, win.renderer,
-                                   ch, x, y,
-                                   fg_r, fg_g, fg_b);
-                }
-            }
-        }
-
-        /* Blinking cursor — only in live view */
-        if (term->scroll_offset == 0) {
-            Uint32 ticks = SDL_GetTicks();
-            if ((ticks / 500) % 2 == 0) {
-                SDL_SetRenderDrawColor(win.renderer,
-                                       220, 220, 220, 200);
-                SDL_Rect cur = {
-                    term->cursor_col * font.cell_width,
-                    term->cursor_row * font.cell_height
-                        + TAB_BAR_HEIGHT,
-                    font.cell_width,
-                    font.cell_height
-                };
-                SDL_RenderFillRect(win.renderer, &cur);
-            }
-        }
-
-        /* Scroll indicator */
-        if (term->scroll_offset > 0) {
-            SDL_SetRenderDrawColor(win.renderer, 80, 140, 255, 220);
-            SDL_Rect top_line = {0, TAB_BAR_HEIGHT, win.width, 2};
-            SDL_RenderFillRect(win.renderer, &top_line);
-
-            if (term->sb_count > 0) {
-                float ratio = (float)term->scroll_offset
-                              / (float)term->sb_count;
-                int bar_h = win.height / 8;
-                int bar_y = TAB_BAR_HEIGHT
-                            + (int)((win.height - TAB_BAR_HEIGHT
-                                     - bar_h) * (1.0f - ratio));
-                SDL_SetRenderDrawColor(win.renderer,
-                                       80, 140, 255, 160);
-                SDL_Rect bar = {win.width - 4, bar_y, 4, bar_h};
-                SDL_RenderFillRect(win.renderer, &bar);
-            }
-        }
+        /* ── 3c. Render all leaf panes ── */
+        render_pane_tree(tab->root, win.renderer, &font);
 
         window_render_end(&win);
 
     } /* end main loop */
 
+
+    /* ── Cleanup ─────────────────────────────────────────────── */
     tabs_destroy(&tm);
     font_destroy(&font);
     window_destroy(&win);

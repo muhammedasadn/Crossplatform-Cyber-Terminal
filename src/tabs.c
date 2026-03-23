@@ -1,9 +1,9 @@
 /*
  * tabs.c — Tab management implementation.
  *
- * Each tab is an independent shell session with its own
- * PTY process and Terminal grid. The TabManager owns all
- * tabs and tracks which one is currently focused.
+ * Each tab owns a pane tree. Opening a tab creates one leaf
+ * pane (single shell). Splitting panes happens via pane.c.
+ * Closing a tab destroys the entire pane tree.
  */
 
 #include "tabs.h"
@@ -13,31 +13,25 @@
 #include <string.h>
 
 
-/* ── Internal helper ────────────────────────────────────────── */
+/* ── Internal: open_tab ─────────────────────────────────────── */
 
 /*
- * open_tab — allocates and starts one tab at index i.
- * Creates a fresh Terminal and spawns a new PTY/bash.
+ * Initialises slot i in the tabs array.
+ * Creates one PANE_LEAF with its own Terminal and PTY.
+ * Sets alive=1 and writes a title string.
  */
 static int open_tab(TabManager *tm, int i, int cols, int rows) {
     Tab *t = &tm->tabs[i];
 
-    /* Create the terminal grid + parser */
-    t->term = terminal_create(cols, rows);
-    if (!t->term) {
-        fprintf(stderr, "tab %d: terminal_create failed\n", i);
+    t->root = pane_create_leaf(cols, rows);
+    if (!t->root) {
+        fprintf(stderr, "open_tab %d: pane_create_leaf failed\n", i);
         return -1;
     }
 
-    /* Spawn the shell process */
-    if (pty_init(&t->pty, cols, rows) != 0) {
-        fprintf(stderr, "tab %d: pty_init failed\n", i);
-        terminal_destroy(t->term);
-        t->term = NULL;
-        return -1;
-    }
+    /* The root leaf starts focused */
+    t->root->focused = 1;
 
-    /* Label shown in the tab bar */
     snprintf(t->title, sizeof(t->title), "bash [%d]", i + 1);
     t->alive = 1;
 
@@ -49,17 +43,22 @@ static int open_tab(TabManager *tm, int i, int cols, int rows) {
 
 int tabs_init(TabManager *tm, int cols, int rows) {
     /*
-     * Zero the entire struct so all pointers start NULL
-     * and alive flags start 0. calloc/memset both work here.
+     * Zero the whole struct first.
+     * This ensures all Tab.root pointers start NULL and
+     * all alive flags start 0, which matters for
+     * safe iteration in tabs_destroy.
      */
     memset(tm, 0, sizeof(TabManager));
     tm->count  = 0;
     tm->active = 0;
 
-    if (open_tab(tm, 0, cols, rows) != 0) return -1;
-    tm->count = 1;
+    if (open_tab(tm, 0, cols, rows) != 0) {
+        fprintf(stderr, "tabs_init: failed to open first tab\n");
+        return -1;
+    }
 
-    printf("TabManager initialized, first tab opened.\n");
+    tm->count = 1;
+    printf("TabManager ready. First tab opened.\n");
     return 0;
 }
 
@@ -72,14 +71,14 @@ int tabs_new(TabManager *tm, int cols, int rows) {
         return -1;
     }
 
-    int i = tm->count;
+    int i = tm->count;   /* New tab goes at the end */
 
     if (open_tab(tm, i, cols, rows) != 0) return -1;
 
     tm->count++;
-    tm->active = i;  /* Focus the newly opened tab */
+    tm->active = i;      /* Switch focus to the new tab */
 
-    printf("Opened tab %d (total: %d)\n", i + 1, tm->count);
+    printf("Tab %d opened (total: %d)\n", i + 1, tm->count);
     return 0;
 }
 
@@ -89,7 +88,7 @@ int tabs_new(TabManager *tm, int cols, int rows) {
 void tabs_close(TabManager *tm, int i) {
     if (i < 0 || i >= tm->count) return;
 
-    /* Never close the last tab — would leave nothing to render */
+    /* Never close the last remaining tab */
     if (tm->count <= 1) {
         fprintf(stderr, "tabs_close: refusing to close last tab\n");
         return;
@@ -97,45 +96,43 @@ void tabs_close(TabManager *tm, int i) {
 
     Tab *t = &tm->tabs[i];
 
-    /* Shut down the shell and free the terminal grid */
-    pty_destroy(&t->pty);
-    terminal_destroy(t->term);
-    t->term  = NULL;
+    /* Destroy the entire pane tree for this tab */
+    pane_destroy(t->root);
+    t->root  = NULL;
     t->alive = 0;
 
     /*
-     * Shift all tabs after position i one step to the left.
-     * This keeps the array compact — no gaps, no holes.
-     * memmove handles overlapping memory regions safely.
+     * Shift all tabs after position i one place to the left.
+     * Keeps the array compact with no empty holes.
+     * memmove is safe for overlapping regions.
      */
-    int remaining = tm->count - i - 1;
-    if (remaining > 0) {
+    int tail = tm->count - i - 1;
+    if (tail > 0) {
         memmove(&tm->tabs[i], &tm->tabs[i + 1],
-                remaining * sizeof(Tab));
+                tail * sizeof(Tab));
     }
 
-    /* Zero the now-empty last slot */
+    /* Zero the vacated last slot */
     memset(&tm->tabs[tm->count - 1], 0, sizeof(Tab));
     tm->count--;
 
-    /* Keep active index in valid range */
-    if (tm->active >= tm->count) {
+    /* Clamp active index to valid range */
+    if (tm->active >= tm->count)
         tm->active = tm->count - 1;
-    }
 
-    printf("Closed tab %d (remaining: %d)\n", i + 1, tm->count);
+    printf("Tab %d closed (remaining: %d)\n", i + 1, tm->count);
 }
 
 
 /* ── tabs_next / tabs_prev ──────────────────────────────────── */
 
 void tabs_next(TabManager *tm) {
-    /* % operator gives wraparound: last+1 wraps to 0 */
+    /* (n + 1) % count wraps last → 0 */
     tm->active = (tm->active + 1) % tm->count;
 }
 
 void tabs_prev(TabManager *tm) {
-    /* Adding count prevents negative: 0-1+count = count-1 */
+    /* (n + count - 1) % count wraps 0 → last */
     tm->active = (tm->active + tm->count - 1) % tm->count;
 }
 
@@ -143,9 +140,8 @@ void tabs_prev(TabManager *tm) {
 /* ── tabs_set_active ────────────────────────────────────────── */
 
 void tabs_set_active(TabManager *tm, int i) {
-    if (i >= 0 && i < tm->count) {
+    if (i >= 0 && i < tm->count)
         tm->active = i;
-    }
 }
 
 
@@ -159,62 +155,61 @@ Tab *tabs_get_active(TabManager *tm) {
 /* ── tabs_draw_bar ──────────────────────────────────────────── */
 
 /*
- * Renders the tab bar strip at the very top of the window.
+ * Renders the tab bar at the very top of the window.
  *
- * Layout:
- *   [tab 0][tab 1][tab 2]...[+]
+ * Visual layout (left to right):
+ *   [tab 0 title  x][tab 1 title  x][tab 2 title  x][+]
  *
- * Active tab: lighter background + blue top accent line.
- * Inactive tabs: darker background, dimmer text.
- * "+" button: opens a new tab.
- * "x" button: appears at right of each tab, closes it.
+ * Active tab:   lighter background + blue top accent line.
+ * Inactive tab: darker background, dimmer text.
+ * Close button: "x" near the right edge of each tab.
+ * New tab:      "+" button after the last tab.
+ * Bottom border: thin separator line.
  */
 void tabs_draw_bar(TabManager *tm, SDL_Renderer *renderer,
                    void *font_ptr, int win_width) {
     Font *font = (Font *)font_ptr;
 
-    /* Tab bar background */
+    /* ── Background of the entire bar ── */
     SDL_SetRenderDrawColor(renderer, 22, 22, 22, 255);
     SDL_Rect bar_bg = {0, 0, win_width, TAB_BAR_HEIGHT};
     SDL_RenderFillRect(renderer, &bar_bg);
 
-    /* Draw each tab */
+    /* ── Each tab button ── */
     for (int i = 0; i < tm->count; i++) {
         int x         = i * TAB_WIDTH;
         int is_active = (i == tm->active);
 
-        /* Tab background fill */
-        if (is_active) {
-            SDL_SetRenderDrawColor(renderer, 48, 48, 48, 255);
-        } else {
-            SDL_SetRenderDrawColor(renderer, 28, 28, 28, 255);
-        }
+        /* Tab background */
+        SDL_SetRenderDrawColor(renderer,
+                               is_active ? 48 : 28,
+                               is_active ? 48 : 28,
+                               is_active ? 48 : 28,
+                               255);
         SDL_Rect tab_rect = {x + 1, 1, TAB_WIDTH - 2, TAB_BAR_HEIGHT - 1};
         SDL_RenderFillRect(renderer, &tab_rect);
 
-        /* Blue top accent line on active tab */
+        /* Blue top accent on active tab */
         if (is_active) {
             SDL_SetRenderDrawColor(renderer, 80, 160, 255, 255);
             SDL_Rect accent = {x + 1, 1, TAB_WIDTH - 2, 2};
             SDL_RenderFillRect(renderer, &accent);
         }
 
-        /* Tab title text color: bright if active, dim otherwise */
+        /* Title text */
         Uint8 tr = is_active ? 220 : 120;
         Uint8 tg = is_active ? 220 : 120;
         Uint8 tb = is_active ? 220 : 120;
 
-        /* Vertically center text in the bar */
         int text_y = (TAB_BAR_HEIGHT - font->cell_height) / 2;
         int text_x = x + 8;
 
-        /* Draw title, capped to 14 chars to fit the tab */
         char display[20];
         snprintf(display, sizeof(display), "%.14s", tm->tabs[i].title);
         font_draw_string(font, renderer, display,
                          text_x, text_y, tr, tg, tb);
 
-        /* Close button "x" at right side of tab */
+        /* Close "x" button — right side of tab */
         int close_x = x + TAB_WIDTH - font->cell_width - 8;
         font_draw_char(font, renderer, 'x',
                        close_x, text_y, 160, 70, 70);
@@ -226,7 +221,7 @@ void tabs_draw_bar(TabManager *tm, SDL_Renderer *renderer,
                            x + TAB_WIDTH - 1, TAB_BAR_HEIGHT - 3);
     }
 
-    /* "+" new tab button — appears right after the last tab */
+    /* ── "+" new-tab button ── */
     int plus_x = tm->count * TAB_WIDTH;
     if (plus_x + 40 <= win_width) {
         SDL_SetRenderDrawColor(renderer, 33, 33, 33, 255);
@@ -239,7 +234,7 @@ void tabs_draw_bar(TabManager *tm, SDL_Renderer *renderer,
                        90, 190, 90);
     }
 
-    /* Bottom border line separating tab bar from terminal area */
+    /* ── Bottom separator line ── */
     SDL_SetRenderDrawColor(renderer, 55, 55, 55, 255);
     SDL_RenderDrawLine(renderer,
                        0, TAB_BAR_HEIGHT - 1,
@@ -249,39 +244,28 @@ void tabs_draw_bar(TabManager *tm, SDL_Renderer *renderer,
 
 /* ── tabs_handle_click ──────────────────────────────────────── */
 
-/*
- * Handles a mouse click that landed in the tab bar area.
- * Returns 1 if the click was consumed (don't pass to terminal).
- * Returns 0 if the click was outside the tab bar.
- *
- * Click zones:
- *   Rightmost 20px of a tab  → close that tab
- *   Rest of a tab            → activate that tab
- *   "+" button area          → open new tab
- */
 int tabs_handle_click(TabManager *tm, int mouse_x, int mouse_y,
                       int cols, int rows) {
-    /* Only handle clicks within the tab bar */
+    /* Only handle clicks within the tab bar height */
     if (mouse_y < 0 || mouse_y >= TAB_BAR_HEIGHT) return 0;
 
-    /* Check "+" new tab button */
+    /* "+" button */
     int plus_x = tm->count * TAB_WIDTH;
     if (mouse_x >= plus_x && mouse_x < plus_x + 40) {
         tabs_new(tm, cols, rows);
         return 1;
     }
 
-    /* Which tab index was clicked? */
+    /* Which tab? */
     int i = mouse_x / TAB_WIDTH;
     if (i < 0 || i >= tm->count) return 0;
 
     /* Close button = rightmost 20px of the tab */
     int close_start = (i * TAB_WIDTH) + TAB_WIDTH - 20;
-    if (mouse_x >= close_start) {
+    if (mouse_x >= close_start)
         tabs_close(tm, i);
-    } else {
+    else
         tabs_set_active(tm, i);
-    }
 
     return 1;
 }
@@ -289,16 +273,11 @@ int tabs_handle_click(TabManager *tm, int mouse_x, int mouse_y,
 
 /* ── tabs_destroy ───────────────────────────────────────────── */
 
-/*
- * Frees all open tabs in order.
- * Always call this before exiting the program.
- */
 void tabs_destroy(TabManager *tm) {
     for (int i = 0; i < tm->count; i++) {
-        if (tm->tabs[i].alive) {
-            pty_destroy(&tm->tabs[i].pty);
-            terminal_destroy(tm->tabs[i].term);
-            tm->tabs[i].term  = NULL;
+        if (tm->tabs[i].alive && tm->tabs[i].root) {
+            pane_destroy(tm->tabs[i].root);
+            tm->tabs[i].root  = NULL;
             tm->tabs[i].alive = 0;
         }
     }
