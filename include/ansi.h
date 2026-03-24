@@ -2,12 +2,16 @@
 #define ANSI_H
 
 /*
- * ansi.h — Terminal emulation: cell grid, ANSI/VT100 parser,
- *           scrollback buffer.
+ * ansi.h — Terminal emulation types and public API.
  *
- * This header defines every data type and function used by
- * the terminal emulation layer. It is included by ansi.c
- * (implementation) and main.c (rendering + input).
+ * Defines everything needed for the ANSI/VT100 parser:
+ *   - Color (24-bit RGB)
+ *   - Cell (one character position on screen)
+ *   - ScrollbackLine (one saved history line)
+ *   - ParserState (3-state FSM)
+ *   - Terminal (owns the grid, parser state, scrollback)
+ *
+ * Include this in any file that reads or writes terminal state.
  */
 
 #include <stdint.h>
@@ -15,32 +19,26 @@
 
 /* ── Constants ──────────────────────────────────────────────── */
 
-/* Number of ASCII codepoints we handle (0–127) */
+/* Total ASCII codepoints handled (0–127) */
 #define GLYPH_COUNT     128
 
-/* Maximum parameters inside one CSI escape e.g. \x1b[1;32m = 2 */
+/* Max parameters in one CSI sequence e.g. \x1b[1;32m has 2 */
 #define MAX_PARAMS      16
 
-/* Maximum lines kept in scrollback ring buffer */
+/* Max lines kept in scrollback ring buffer */
 #define SCROLLBACK_MAX  5000
 
 
 /* ── Color ──────────────────────────────────────────────────── */
 
-/*
- * Color — 24-bit RGB.
- * Every cell on the grid has its own fg and bg color,
- * so colored text is preserved in the scrollback too.
- */
 typedef struct {
     uint8_t r, g, b;
 } Color;
 
 /*
- * ANSI_COLORS — the 16 standard terminal palette entries.
- * Indices 0–7 are normal colors, 8–15 are bright variants.
- * Programs select them with SGR codes 30–37 (fg) / 40–47 (bg)
- * and 90–97 (bright fg) / 100–107 (bright bg).
+ * Standard 16 ANSI colors.
+ * Indices 0–7  = normal colors (SGR 30–37 fg, 40–47 bg)
+ * Indices 8–15 = bright colors (SGR 90–97 fg, 100–107 bg)
  */
 static const Color ANSI_COLORS[16] = {
     {  0,   0,   0},  /*  0 Black          */
@@ -67,114 +65,110 @@ static const Color ANSI_COLORS[16] = {
 /*
  * Cell — one character position on the terminal grid.
  *
- * The entire visible screen is a 2D array of Cells:
- *   cells[row][col]
+ * The entire screen is cells[rows][cols].
+ * Each cell is completely independent — it stores its own
+ * character, foreground color, background color, and bold flag.
+ * This is how ANSI colors work: every cell knows its own colors.
  *
- * Each Cell stores the character, its colors, and text
- * attributes independently. This means every cell can have
- * a different color, which is how ANSI color output works.
- *
- * dirty: set to 1 when the cell changes. A future optimization
- * can skip redrawing clean cells. Currently we redraw all.
+ * dirty = 1 means this cell changed since the last frame.
+ * Used by the dirty-cell optimization in Module 11 to skip
+ * redrawing cells that haven't changed.
  */
 typedef struct {
-    char  ch;       /* Character to display (printable ASCII)  */
-    Color fg;       /* Foreground (text) color                 */
-    Color bg;       /* Background color                        */
-    int   bold;     /* 1 = bold / bright weight                */
-    int   dirty;    /* 1 = changed since last frame            */
+    char  ch;       /* Character to display (printable ASCII)   */
+    Color fg;       /* Foreground (text) color                  */
+    Color bg;       /* Background color                         */
+    int   bold;     /* 1 = bold / bright weight                 */
+    int   dirty;    /* 1 = changed since last render            */
 } Cell;
 
 
-/* ── Scrollback ─────────────────────────────────────────────── */
+/* ── ScrollbackLine ─────────────────────────────────────────── */
 
 /*
  * ScrollbackLine — one saved line of terminal history.
  *
  * When a line scrolls off the top of the visible screen,
- * we deep-copy it into the scrollback ring buffer as a
- * ScrollbackLine. We store the full Cell array (not just
- * characters) so colors are preserved when you scroll back.
+ * scroll_up() deep-copies it here before overwriting.
+ * We save the full Cell array (not just characters) so colors
+ * are preserved when the user scrolls back through history.
  *
- * cols is stored per-line because the terminal may have been
- * resized between when the line was captured and now.
+ * cols is saved per-line because the terminal may have been
+ * resized between when this line was captured and now.
  */
 typedef struct {
     Cell *cells;   /* Heap-allocated array of 'cols' Cell structs */
-    int   cols;    /* Number of columns when this line was saved  */
+    int   cols;    /* Column count when this line was captured    */
 } ScrollbackLine;
 
 
-/* ── Parser state ───────────────────────────────────────────── */
+/* ── ParserState ────────────────────────────────────────────── */
 
 /*
- * ParserState — the three states of the ANSI escape parser.
+ * The ANSI parser is a 3-state finite state machine (FSM).
  *
- * The parser is a simple finite state machine (FSM).
- * It reads one byte at a time and transitions between states:
+ * STATE_NORMAL  → regular character → write to grid
+ *              → \x1b received     → switch to STATE_ESCAPE
  *
- *   NORMAL  → regular character, write to grid
- *           → \x1b received → switch to ESCAPE
+ * STATE_ESCAPE  → '[' received     → switch to STATE_CSI
+ *              → other             → handle or ignore, back to NORMAL
  *
- *   ESCAPE  → '[' received → switch to CSI
- *           → anything else → back to NORMAL
- *
- *   CSI     → digit/semicolon → accumulate parameter bytes
- *           → letter (A–Z, a–z) → apply command, back to NORMAL
- *           → unexpected byte → abort, back to NORMAL
+ * STATE_CSI     → digit/semicolon/'?' → accumulate parameter bytes
+ *              → letter (0x40-0x7E)   → apply command, back to NORMAL
+ *              → unexpected byte      → abort, back to NORMAL
  */
 typedef enum {
-    STATE_NORMAL,   /* Reading regular printable characters     */
-    STATE_ESCAPE,   /* Just received ESC byte (0x1b)            */
-    STATE_CSI       /* Inside a CSI sequence, collecting params */
+    STATE_NORMAL,   /* Reading regular printable characters      */
+    STATE_ESCAPE,   /* Just received ESC byte (0x1b)             */
+    STATE_CSI       /* Inside CSI sequence, collecting params    */
 } ParserState;
 
 
 /* ── Terminal ───────────────────────────────────────────────── */
 
 /*
- * Terminal — the complete state of one terminal session.
+ * Terminal — complete state of one terminal session.
  *
- * This struct owns:
- *   - The visible cell grid (cells[rows][cols])
- *   - The current cursor position
- *   - The current drawing attributes (color, bold)
- *   - The ANSI parser's internal state
- *   - The scrollback ring buffer
- *   - The current scroll position (viewport offset)
+ * Owns:
+ *   cells[][]     — the visible character grid
+ *   cursor        — current draw position
+ *   current_fg/bg — active colors for new characters
+ *   bold          — active bold flag
+ *   state/params  — ANSI parser FSM state
+ *   scrollback[]  — ring buffer of historical lines
+ *   scroll_offset — how many lines we've scrolled up (0=live)
  *
- * One Terminal corresponds to one PTY / one shell session.
- * When we add tabs in Module 7, each tab will have its own
- * Terminal instance.
+ * One Terminal per PTY session. When tabs have split panes,
+ * each leaf Pane owns one Terminal independently.
  */
 typedef struct {
 
     /* ── Visible grid ── */
-    Cell **cells;       /* 2D array: cells[row][col]            */
-    int    cols;        /* Current terminal width in characters  */
-    int    rows;        /* Current terminal height in characters */
+    Cell **cells;        /* 2D array: cells[row][col]             */
+    int    cols;         /* Current width in characters           */
+    int    rows;         /* Current height in characters          */
 
-    /* ── Cursor ── */
-    int    cursor_col;  /* 0-based column position              */
-    int    cursor_row;  /* 0-based row position                 */
+    /* ── Cursor position ── */
+    int    cursor_col;   /* 0-based column                        */
+    int    cursor_row;   /* 0-based row                           */
 
-    /* ── Current drawing attributes ── */
-    Color  current_fg;  /* Foreground color for new characters  */
-    Color  current_bg;  /* Background color for new characters  */
-    int    bold;        /* 1 if bold mode is active             */
+    /* ── Active drawing attributes ── */
+    Color  current_fg;   /* Foreground color for new chars        */
+    Color  current_bg;   /* Background color for new chars        */
+    int    bold;         /* 1 if bold mode is active              */
 
     /* ── ANSI parser state ── */
-    ParserState  state;         /* Current parser FSM state     */
-    char         params[64];    /* Raw parameter string buffer  */
-    int          params_len;    /* Bytes written into params[]  */
+    ParserState  state;          /* Current FSM state             */
+    char         params[64];     /* Raw CSI parameter bytes       */
+    int          params_len;     /* Bytes written into params[]   */
 
     /* ── Scrollback ring buffer ── */
-    ScrollbackLine scrollback[SCROLLBACK_MAX]; /* fixed-size ring */
-    int            sb_head;     /* Next write index (0-based)   */
-    int            sb_count;    /* Lines stored so far          */
+    ScrollbackLine scrollback[SCROLLBACK_MAX];
+    int            sb_head;      /* Next write slot (wraps)       */
+    int            sb_count;     /* Lines stored so far           */
 
     /* ── Viewport ── */
-    int            scroll_offset; /* 0=live bottom, N=up N lines */
+    int            scroll_offset; /* 0=live, N=scrolled up N lines */
 
 } Terminal;
 
@@ -183,34 +177,34 @@ typedef struct {
 
 /*
  * terminal_create — allocate and initialize a Terminal.
- * Returns a heap pointer; caller must call terminal_destroy().
+ * Returns heap pointer. Caller must call terminal_destroy().
  */
 Terminal *terminal_create(int cols, int rows);
 
 /*
  * terminal_destroy — free all memory owned by the Terminal.
- * Always call this before exiting or closing a tab.
+ * Always call before closing a tab or pane.
  */
 void terminal_destroy(Terminal *t);
 
 /*
- * terminal_process — feed raw PTY bytes into the parser.
+ * terminal_process — feed raw PTY bytes into the ANSI parser.
  * Call this every frame after pty_read() returns data.
- * The parser updates the cell grid and cursor in place.
+ * Updates the cell grid and cursor position in place.
  */
 void terminal_process(Terminal *t, const char *buf, int len);
 
 /*
- * terminal_resize — rebuild the grid at a new size.
- * Call this when the SDL2 window is resized.
+ * terminal_resize — rebuild the cell grid at a new size.
+ * Call when the SDL2 window or pane rect changes size.
  * Also call pty_resize() afterwards to notify the shell.
  */
 void terminal_resize(Terminal *t, int cols, int rows);
 
 /*
  * scrollback_get — retrieve a stored line by recency index.
- * index 0 = most recently scrolled-off line.
- * index 1 = one before that. Returns NULL if out of range.
+ * index 0 = most recently saved line (just scrolled off top).
+ * Returns NULL if index is out of range.
  */
 ScrollbackLine *scrollback_get(Terminal *t, int index);
 
@@ -218,12 +212,11 @@ ScrollbackLine *scrollback_get(Terminal *t, int index);
  * terminal_get_display_row — returns the Cell array to render
  * for a given screen row, accounting for scroll_offset.
  *
- * When scroll_offset == 0: returns live cells[row].
- * When scrolled: returns the appropriate historical line.
- * Returns NULL if the row has no content (render as blank).
+ * scroll_offset == 0  → returns live cells[row]
+ * scroll_offset == N  → returns historical line from scrollback
  *
- * Use this in the render loop instead of accessing
- * term->cells[row] directly.
+ * Returns NULL for rows with no content (render as blank).
+ * Use this in the render loop instead of t->cells[row] directly.
  */
 Cell *terminal_get_display_row(Terminal *t, int screen_row);
 
