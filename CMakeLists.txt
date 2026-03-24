@@ -2,22 +2,18 @@ cmake_minimum_required(VERSION 3.16)
 project(cterm C)
 
 # ── C standard ───────────────────────────────────────────────
-# C99: // comments, designated initialisers, <stdint.h>, etc.
 set(CMAKE_C_STANDARD 99)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
-# ── Feature-test macros — set GLOBALLY for all source files ──
+# ── Feature-test macros — applied to EVERY source file ───────
 #
-# These must reach the compiler before any system header is
-# processed. Setting them here in CMake guarantees every .c
-# file in the project compiles with them defined, which is
-# safer than relying on each file to define them correctly.
+# add_compile_definitions() passes these as -D flags on the
+# compiler command line, which is processed BEFORE any source
+# file content. This is the most reliable way to ensure
+# _GNU_SOURCE reaches every header on every file.
 #
-# _GNU_SOURCE     — exposes GNU/Linux extensions: openpty(),
-#                   getline(), strdup(), and many others.
-# _DEFAULT_SOURCE — equivalent on newer glibc versions.
-#                   Both together cover all Ubuntu/Debian
-#                   versions from 14.04 onward.
+# _GNU_SOURCE     — exposes openpty(), strdup(), getline(), etc.
+# _DEFAULT_SOURCE — equivalent on newer glibc (Ubuntu 20.04+)
 add_compile_definitions(
     _GNU_SOURCE
     _DEFAULT_SOURCE
@@ -34,29 +30,45 @@ include_directories(${SDL2_INCLUDE_DIRS})
 find_package(Freetype REQUIRED)
 include_directories(${FREETYPE_INCLUDE_DIRS})
 
-# ── Source files ─────────────────────────────────────────────
+# ── Source files ──────────────────────────────────────────────
+#
+# Every .c file in the project listed here.
+# CMake tracks dependencies and recompiles only changed files.
+#
 add_executable(cterm
-    src/main.c       # Entry point, main loop, event handling
-    src/window.c     # SDL2 window + renderer init/destroy
-    src/font.c       # FreeType glyph cache + text rendering
-    src/pty.c        # PTY open, read, write, resize, destroy
-    src/ansi.c       # ANSI/VT100 parser + terminal cell grid
-    src/tabs.c       # Tab bar + TabManager
-    src/pane.c       # Split pane tree (recursive binary tree)
+    src/main.c        # Entry point, main loop, event handling
+    src/window.c      # SDL2 window + renderer init/destroy
+    src/font.c        # FreeType glyph cache + text rendering
+    src/pty.c         # PTY open, fork, read, write, resize
+    src/ansi.c        # ANSI/VT100 parser + terminal cell grid
+    src/tabs.c        # Tab bar + TabManager
+    src/pane.c        # Split pane binary tree
+    src/tools.c       # Built-in tool launcher overlay
 )
 
 # ── Link libraries ────────────────────────────────────────────
+#
+# SDL2_LIBRARIES     — window, renderer, input events
+# FREETYPE_LIBRARIES — font rasterisation
+# util               — provides openpty() on Linux
+# m                  — math library (FreeType dependency)
+#
 target_link_libraries(cterm
-    ${SDL2_LIBRARIES}       # Window, renderer, events, input
-    ${FREETYPE_LIBRARIES}   # Font rasterisation
-    util                    # Contains openpty() on Linux
-    m                       # Math library (FreeType uses it)
+    ${SDL2_LIBRARIES}
+    ${FREETYPE_LIBRARIES}
+    util
+    m
 )
 
-# ── Compiler warnings + debug symbols ────────────────────────
-# -Wall/-Wextra  catch real bugs during development.
-# -g             embeds debug symbols for use with gdb.
-# Remove -g and add -O2 for a release/production build.
+# ── Compiler flags ────────────────────────────────────────────
+#
+# -Wall              catch common mistakes
+# -Wextra            catch extra suspicious code
+# -Wno-unused-parameter  suppress "parameter not used" noise
+# -g                 embed debug symbols (remove for release)
+#
+# For a release build, replace -g with -O2 -DNDEBUG
+#
 target_compile_options(cterm PRIVATE
     -Wall
     -Wextra
