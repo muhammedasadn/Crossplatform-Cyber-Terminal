@@ -1,23 +1,28 @@
 /*
  * main.c — cterm entry point.
  *
- * Wires all modules together:
- *   window   → SDL2 window + GPU renderer
- *   font     → FreeType glyph cache
- *   tabs     → tab bar + TabManager
- *   pane     → split pane tree per tab
- *   ansi     → ANSI/VT100 parser + cell grid
- *   pty      → shell process (one per leaf pane)
+ * Modules wired together here:
+ *   window  → SDL2 window + GPU renderer
+ *   font    → FreeType glyph cache
+ *   tabs    → tab bar + TabManager
+ *   pane    → split pane tree per tab
+ *   ansi    → ANSI/VT100 parser + cell grid
+ *   pty     → shell process (one per leaf pane)
+ *   tools   → built-in tool launcher overlay
  *
  * Main loop each frame:
- *   1. Poll SDL2 events (keyboard, mouse, resize, quit)
+ *   1. Poll SDL2 events
  *   2. Read PTY output for every pane in every tab
- *   3. Compute pane layout (pixel rects)
- *   4. Render tab bar
- *   5. Render all leaf panes of the active tab
- *   6. Draw pane dividers + focus border
- *   7. Draw cursor + scroll indicator
+ *   3. Render tab bar
+ *   4. Compute pane layout + render all leaf panes
+ *   5. Draw pane dividers + focus border
+ *   6. Draw tool launcher overlay (if open)
+ *   7. Present frame
  */
+
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 
 #include <stdio.h>
 #include <string.h>
@@ -27,49 +32,49 @@
 #include "tabs.h"
 #include "pane.h"
 #include "ansi.h"
+#include "tools.h"
 
 
 /* ── render_pane_tree ───────────────────────────────────────── */
 
 /*
- * Recursively renders every leaf pane in the tree.
+ * Recursively renders every leaf pane in the pane tree.
  *
- * For PANE_LEAF:
- *   - Recomputes cols/rows from the pane's pixel rect.
+ * For each PANE_LEAF:
+ *   - Recalculates cols/rows from the pane's pixel rect.
  *   - Calls terminal_resize + pty_resize if dimensions changed.
- *   - Draws background rects and character glyphs for every cell.
- *   - Draws the blinking cursor if this pane is focused.
+ *   - Draws background rects and character glyphs.
+ *   - Draws blinking cursor if this pane is focused.
+ *   - Draws scroll indicator if scrolled into history.
  *
- * For PANE_SPLIT:
- *   - Recurses into first and second children.
+ * For PANE_SPLIT nodes: recurses into first and second children.
  *
- * Called once per frame after pane_layout() has computed rects.
+ * Must be called AFTER pane_layout() so all rects are current.
  */
 static void render_pane_tree(Pane *p, SDL_Renderer *renderer,
-                             Font *font) {
+                              Font *font) {
     if (!p) return;
 
     if (p->type != PANE_LEAF) {
-        /* Split node — recurse into both children */
         render_pane_tree(p->first,  renderer, font);
         render_pane_tree(p->second, renderer, font);
         return;
     }
 
     /* ── Leaf pane ── */
-    Terminal *term  = p->term;
-    SDL_Rect  r     = p->rect;
+    Terminal *term = p->term;
+    SDL_Rect   r   = p->rect;
 
     /* Skip degenerate rects */
     if (r.w < font->cell_width || r.h < font->cell_height) return;
 
-    /* Recompute grid dimensions from pixel rect */
+    /* Recalculate grid from pixel rect */
     int pcols = r.w / font->cell_width;
     int prows = r.h / font->cell_height;
     if (pcols < 1) pcols = 1;
     if (prows < 1) prows = 1;
 
-    /* Resize terminal + PTY if the pane size changed */
+    /* Resize terminal + PTY when pane dimensions change */
     if (pcols != term->cols || prows != term->rows) {
         terminal_resize(term, pcols, prows);
         pty_resize(&p->pty, pcols, prows);
@@ -83,7 +88,7 @@ static void render_pane_tree(Pane *p, SDL_Renderer *renderer,
             int x = r.x + col * font->cell_width;
             int y = r.y + row * font->cell_height;
 
-            /* Skip cells that would draw outside the pane rect */
+            /* Clip to pane bounds */
             if (x + font->cell_width  > r.x + r.w) continue;
             if (y + font->cell_height > r.y + r.h) continue;
 
@@ -102,8 +107,11 @@ static void render_pane_tree(Pane *p, SDL_Renderer *renderer,
             }
 
             /* Cell background */
-            SDL_SetRenderDrawColor(renderer, bg_r, bg_g, bg_b, 255);
-            SDL_Rect bg_rect = {x, y, font->cell_width, font->cell_height};
+            SDL_SetRenderDrawColor(renderer,
+                                   bg_r, bg_g, bg_b, 255);
+            SDL_Rect bg_rect = {x, y,
+                                font->cell_width,
+                                font->cell_height};
             SDL_RenderFillRect(renderer, &bg_rect);
 
             /* Character glyph */
@@ -114,7 +122,7 @@ static void render_pane_tree(Pane *p, SDL_Renderer *renderer,
         }
     }
 
-    /* ── Blinking cursor (focused pane, live view only) ── */
+    /* ── Blinking cursor — focused pane, live view only ── */
     if (p->focused && term->scroll_offset == 0) {
         Uint32 ticks = SDL_GetTicks();
         if ((ticks / 500) % 2 == 0) {
@@ -129,9 +137,9 @@ static void render_pane_tree(Pane *p, SDL_Renderer *renderer,
         }
     }
 
-    /* ── Scroll indicator (focused pane, scrolled view) ── */
+    /* ── Scroll indicator — shown when scrolled into history ── */
     if (p->focused && term->scroll_offset > 0) {
-        /* Blue line at top of pane */
+        /* Blue top line */
         SDL_SetRenderDrawColor(renderer, 80, 140, 255, 220);
         SDL_Rect top_line = {r.x, r.y, r.w, 2};
         SDL_RenderFillRect(renderer, &top_line);
@@ -141,7 +149,8 @@ static void render_pane_tree(Pane *p, SDL_Renderer *renderer,
             float ratio = (float)term->scroll_offset
                           / (float)term->sb_count;
             int bar_h   = r.h / 8;
-            int bar_y   = r.y + (int)((r.h - bar_h) * (1.0f - ratio));
+            int bar_y   = r.y + (int)((r.h - bar_h)
+                          * (1.0f - ratio));
             SDL_SetRenderDrawColor(renderer, 80, 140, 255, 160);
             SDL_Rect bar = {r.x + r.w - 4, bar_y, 4, bar_h};
             SDL_RenderFillRect(renderer, &bar);
@@ -155,9 +164,10 @@ static void render_pane_tree(Pane *p, SDL_Renderer *renderer,
  * ════════════════════════════════════════════════════════════ */
 
 int main(void) {
-    Window     win;
-    Font       font;
-    TabManager tm;
+    Window      win;
+    Font        font;
+    TabManager  tm;
+    ToolManager tools;
 
     /* ── Window ──────────────────────────────────────────────── */
     if (window_init(&win, 900, 550) != 0) {
@@ -166,7 +176,8 @@ int main(void) {
     }
 
     /* ── Font ────────────────────────────────────────────────── */
-    if (font_init(&font, win.renderer, "../assets/font.ttf", 16) != 0) {
+    if (font_init(&font, win.renderer,
+                  "../assets/font.ttf", 16) != 0) {
         fprintf(stderr, "Failed to load font.\n");
         window_destroy(&win);
         return 1;
@@ -176,13 +187,16 @@ int main(void) {
     int cols = win.width  / font.cell_width;
     int rows = (win.height - TAB_BAR_HEIGHT) / font.cell_height;
 
-    /* ── Tab manager — opens first tab + bash ────────────────── */
+    /* ── Tab manager — opens first bash tab ──────────────────── */
     if (tabs_init(&tm, cols, rows) != 0) {
         fprintf(stderr, "Failed to init tabs.\n");
         font_destroy(&font);
         window_destroy(&win);
         return 1;
     }
+
+    /* ── Tool manager — register built-in tools ──────────────── */
+    tools_init(&tools);
 
     char read_buf[4096];
     int  running = 1;
@@ -192,8 +206,8 @@ int main(void) {
      * ════════════════════════════════════════════════════════════ */
     while (running) {
 
-        /* ── Refresh active tab pointer each frame ───────────── */
-        Tab  *tab = tabs_get_active(&tm);
+        /* Refresh active tab pointer at top of every frame */
+        Tab *tab = tabs_get_active(&tm);
 
         /* ── 1. EVENT HANDLING ───────────────────────────────── */
         SDL_Event event;
@@ -214,8 +228,9 @@ int main(void) {
                 rows = (win.height - TAB_BAR_HEIGHT)
                        / font.cell_height;
                 /*
-                 * Resize happens in render_pane_tree automatically
-                 * when leaf pane rects change. No explicit call needed.
+                 * Leaf pane terminals resize automatically in
+                 * render_pane_tree() when their rects change.
+                 * No explicit resize call needed here.
                  */
                 continue;
             }
@@ -224,21 +239,25 @@ int main(void) {
             if (event.type == SDL_MOUSEBUTTONDOWN &&
                 event.button.button == SDL_BUTTON_LEFT) {
 
+                /* Close launcher if open and clicked outside */
+                if (tools.launcher.visible) {
+                    tools_launcher_close(&tools);
+                    continue;
+                }
+
                 int mx = event.button.x;
                 int my = event.button.y;
 
-                /* Tab bar click? */
                 if (my < TAB_BAR_HEIGHT) {
-                    if (tabs_handle_click(&tm, mx, my, cols, rows)) {
+                    /* Click in tab bar */
+                    if (tabs_handle_click(&tm, mx, my,
+                                          cols, rows)) {
                         tab = tabs_get_active(&tm);
                     }
                 } else {
-                    /*
-                     * Click inside terminal area — focus the pane
-                     * that was clicked. pane_find_at searches the
-                     * tree by pixel position.
-                     */
-                    Pane *clicked = pane_find_at(tab->root, mx, my);
+                    /* Click in terminal area — focus that pane */
+                    Pane *clicked = pane_find_at(tab->root,
+                                                 mx, my);
                     if (clicked) {
                         pane_set_focus(tab->root, clicked);
                     }
@@ -246,18 +265,22 @@ int main(void) {
                 continue;
             }
 
-            /* ── Mouse wheel — scrollback on focused pane ── */
+            /* ── Mouse wheel — scrollback ── */
             if (event.type == SDL_MOUSEWHEEL) {
-                Pane *fp = pane_get_focused(tab->root);
-                if (fp && fp->term) {
-                    if (event.wheel.y > 0) {
-                        fp->term->scroll_offset += 3;
-                        if (fp->term->scroll_offset > fp->term->sb_count)
-                            fp->term->scroll_offset = fp->term->sb_count;
-                    } else if (event.wheel.y < 0) {
-                        fp->term->scroll_offset -= 3;
-                        if (fp->term->scroll_offset < 0)
-                            fp->term->scroll_offset = 0;
+                if (!tools.launcher.visible) {
+                    Pane *fp = pane_get_focused(tab->root);
+                    if (fp && fp->term) {
+                        if (event.wheel.y > 0) {
+                            fp->term->scroll_offset += 3;
+                            if (fp->term->scroll_offset
+                                    > fp->term->sb_count)
+                                fp->term->scroll_offset
+                                    = fp->term->sb_count;
+                        } else if (event.wheel.y < 0) {
+                            fp->term->scroll_offset -= 3;
+                            if (fp->term->scroll_offset < 0)
+                                fp->term->scroll_offset = 0;
+                        }
                     }
                 }
                 continue;
@@ -265,21 +288,30 @@ int main(void) {
 
             /* ── Text input — printable characters ── */
             /*
-             * SDL_TEXTINPUT fires ONLY for printable characters.
-             * It never fires when Ctrl or Alt is held, so it cannot
-             * interfere with Ctrl+T, Ctrl+W, etc.
+             * SDL_TEXTINPUT fires ONLY for printable chars.
+             * It never fires when Ctrl/Alt is held so it
+             * cannot interfere with Ctrl+T, Ctrl+P, etc.
+             *
+             * When the launcher is open, text goes to the
+             * search filter. Otherwise it goes to the shell.
              */
             if (event.type == SDL_TEXTINPUT) {
-                Pane *fp = pane_get_focused(tab->root);
-                if (fp) {
-                    fp->term->scroll_offset = 0;
-                    pty_write(&fp->pty, event.text.text,
-                              strlen(event.text.text));
+                if (tools.launcher.visible) {
+                    tools_launcher_handle_text(&tools,
+                                               event.text.text);
+                } else {
+                    Pane *fp = pane_get_focused(tab->root);
+                    if (fp) {
+                        fp->term->scroll_offset = 0;
+                        pty_write(&fp->pty,
+                                  event.text.text,
+                                  strlen(event.text.text));
+                    }
                 }
                 continue;
             }
 
-            /* ── Key down — Ctrl combos + special keys ── */
+            /* ── Key down ── */
             if (event.type == SDL_KEYDOWN) {
                 SDL_Keycode sym = event.key.keysym.sym;
                 SDL_Keymod  mod = SDL_GetModState();
@@ -287,8 +319,21 @@ int main(void) {
                 int ctrl  = (mod & KMOD_CTRL)  != 0;
                 int shift = (mod & KMOD_SHIFT) != 0;
 
+                /* ══ LAUNCHER GETS ALL KEYS WHEN OPEN ══════════ */
+                /*
+                 * When the launcher is visible it intercepts
+                 * every keypress. Nothing goes to the shell.
+                 */
+                if (tools.launcher.visible) {
+                    tools_launcher_handle_key(&tools, sym, mod,
+                                              &tm, cols, rows);
+                    /* Launcher may have opened a new tab */
+                    tab = tabs_get_active(&tm);
+                    continue;
+                }
+
                 /* ══ TAB SHORTCUTS ══════════════════════════════ */
-                /* Checked BEFORE generic Ctrl+letter handler.     */
+                /* Must be checked before generic Ctrl+letter.     */
 
                 /* Ctrl+T — new tab */
                 if (ctrl && !shift && sym == SDLK_t) {
@@ -326,44 +371,36 @@ int main(void) {
                     continue;
                 }
 
+                /* ══ TOOL LAUNCHER SHORTCUT ═════════════════════ */
+
+                /* Ctrl+P — open tool launcher */
+                if (ctrl && !shift && sym == SDLK_p) {
+                    tools_launcher_open(&tools);
+                    continue;
+                }
+
                 /* ══ PANE SHORTCUTS ═════════════════════════════ */
 
-                /* Ctrl+Shift+Right — split focused pane horizontally */
+                /* Ctrl+Shift+Right — split horizontally */
                 if (ctrl && shift && sym == SDLK_RIGHT) {
                     Pane *fp = pane_get_focused(tab->root);
                     if (fp) {
-                        /*
-                         * pane_split replaces the leaf with a split
-                         * node. If fp is the root, we replace the root.
-                         * For deeper panes we need parent tracking —
-                         * for now we replace root in all cases via
-                         * the return value.
-                         */
-                        Pane *new_node = pane_split(fp,
-                                             PANE_SPLIT_H,
-                                             cols, rows);
-                        if (new_node != fp) {
-                            /*
-                             * fp was the root leaf. Replace root.
-                             * For non-root splits the tree is updated
-                             * inside pane_split via pointer rewriting.
-                             */
+                        Pane *new_node = pane_split(
+                            fp, PANE_SPLIT_H, cols, rows);
+                        if (new_node != fp)
                             tab->root = new_node;
-                        }
                     }
                     continue;
                 }
 
-                /* Ctrl+Shift+Down — split focused pane vertically */
+                /* Ctrl+Shift+Down — split vertically */
                 if (ctrl && shift && sym == SDLK_DOWN) {
                     Pane *fp = pane_get_focused(tab->root);
                     if (fp) {
-                        Pane *new_node = pane_split(fp,
-                                             PANE_SPLIT_V,
-                                             cols, rows);
-                        if (new_node != fp) {
+                        Pane *new_node = pane_split(
+                            fp, PANE_SPLIT_V, cols, rows);
+                        if (new_node != fp)
                             tab->root = new_node;
-                        }
                     }
                     continue;
                 }
@@ -372,7 +409,6 @@ int main(void) {
                 if (ctrl && shift && sym == SDLK_w) {
                     tab->root = pane_close_focused(tab->root);
                     if (!tab->root) {
-                        /* All panes in this tab are gone */
                         tabs_close(&tm, tm.active);
                         tab = tabs_get_active(&tm);
                     }
@@ -386,7 +422,11 @@ int main(void) {
                 }
 
                 /* ══ GENERIC Ctrl+letter ════════════════════════ */
-                /* Only reached if NOT a tab/pane shortcut above.  */
+                /*
+                 * Only reached when NOT matched by any shortcut
+                 * above. Sends a control character to the shell.
+                 * Ctrl+A = 0x01, Ctrl+B = 0x02, ..., Ctrl+Z = 0x1A
+                 */
                 if (ctrl && sym >= SDLK_a && sym <= SDLK_z) {
                     Pane *fp = pane_get_focused(tab->root);
                     if (fp) {
@@ -398,10 +438,10 @@ int main(void) {
 
                 /* ══ TERMINAL KEYS ══════════════════════════════ */
                 {
-                    Pane *fp = pane_get_focused(tab->root);
+                    Pane     *fp      = pane_get_focused(tab->root);
                     if (!fp) continue;
 
-                    PTY      *pty  = &fp->pty;
+                    PTY      *pty     = &fp->pty;
                     Terminal *term_fp = fp->term;
 
                     switch (sym) {
@@ -441,8 +481,10 @@ int main(void) {
                             break;
                         case SDLK_PAGEUP:
                             term_fp->scroll_offset += rows / 2;
-                            if (term_fp->scroll_offset > term_fp->sb_count)
-                                term_fp->scroll_offset = term_fp->sb_count;
+                            if (term_fp->scroll_offset
+                                    > term_fp->sb_count)
+                                term_fp->scroll_offset
+                                    = term_fp->sb_count;
                             break;
                         case SDLK_PAGEDOWN:
                             term_fp->scroll_offset -= rows / 2;
@@ -460,15 +502,15 @@ int main(void) {
         } /* end SDL_PollEvent */
 
 
-        /* ── 2. READ PTY OUTPUT ──────────────────────────────── */
+        /* ── 2. READ PTY OUTPUT FOR ALL TABS + PANES ─────────── */
         /*
          * Read from every pane in every tab every frame.
-         * Background tabs keep running — their output is parsed
-         * silently into their grids. Switching to them shows
-         * up-to-date content immediately.
+         * Background tabs keep running — their output is
+         * parsed silently. Switching to them shows current output.
          */
         for (int i = 0; i < tm.count; i++) {
-            pane_read_all(tm.tabs[i].root, read_buf, sizeof(read_buf));
+            pane_read_all(tm.tabs[i].root,
+                          read_buf, sizeof(read_buf));
         }
 
 
@@ -480,9 +522,9 @@ int main(void) {
 
         /* ── 3b. Compute pane layout ── */
         /*
-         * pane_layout() recursively fills every pane's rect field
-         * based on the available terminal area (below the tab bar).
-         * Must be called before rendering so rects are current.
+         * pane_layout() fills every pane's rect field based on
+         * the terminal area (window minus the tab bar).
+         * Must run before render_pane_tree() reads the rects.
          */
         tab = tabs_get_active(&tm);
         SDL_Rect terminal_area = {
@@ -496,15 +538,25 @@ int main(void) {
         /* ── 3c. Render all leaf panes ── */
         render_pane_tree(tab->root, win.renderer, &font);
 
-        /* ── 3d. Draw dividers + focus border ── */
+        /* ── 3d. Dividers + focus border ── */
         pane_draw_dividers(tab->root, win.renderer);
+
+        /* ── 3e. Tool launcher overlay ── */
+        /*
+         * Drawn last so it appears on top of everything else.
+         * The overlay dims the background and shows the tool list.
+         */
+        if (tools.launcher.visible) {
+            tools_launcher_draw(&tools, win.renderer,
+                                &font, win.width, win.height);
+        }
 
         window_render_end(&win);
 
     } /* end main loop */
 
 
-    /* ── Cleanup ─────────────────────────────────────────────── */
+    /* ── Cleanup — reverse order of creation ────────────────── */
     tabs_destroy(&tm);
     font_destroy(&font);
     window_destroy(&win);
