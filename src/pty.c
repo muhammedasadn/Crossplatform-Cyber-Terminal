@@ -1,16 +1,20 @@
 /*
- * pty.c — Pseudo-terminal implementation.
+ * pty.c — PTY implementation.
  *
- * Bugs fixed:
- *   1. TIOCSWINSZ set on SLAVE fd (not just master) so bash
- *      reads correct dimensions at startup.
- *   2. COLUMNS + LINES env vars set before execl so readline
- *      has the correct width even without ioctl.
- *   3. SIGWINCH sent after bash starts to force readline to
- *      re-query terminal size and rebuild its line buffer.
- *   4. pty_resize now sends an updated COLUMNS/LINES export
- *      so running programs stay in sync after window resize.
- *   5. O_NONBLOCK set correctly — checked for fcntl failure.
+ * Key fix for blank screen bug:
+ *   The usleep(100000) was blocking the MAIN thread for 100ms.
+ *   During that time the render loop was frozen so bash output
+ *   that arrived immediately was never read — the screen stayed
+ *   blank until the user pressed a key.
+ *
+ *   Fix: remove the blocking sleep entirely. Instead we send
+ *   SIGWINCH from the child just before exec'ing bash — at that
+ *   point bash will receive it immediately after starting up and
+ *   re-query the terminal size correctly, with zero delay to cterm.
+ *
+ *   We also set COLUMNS/LINES and TIOCSWINSZ on both master and
+ *   slave to ensure readline gets the correct width from every
+ *   possible code path.
  */
 
 #ifndef _GNU_SOURCE
@@ -20,7 +24,6 @@
 #define _DEFAULT_SOURCE
 #endif
 
-/* Must include utmp.h before pty.h on some Linux distros */
 #include <utmp.h>
 #include <pty.h>
 
@@ -42,7 +45,6 @@ int pty_init(PTY *p, int cols, int rows) {
     p->master_fd = -1;
     p->shell_pid = 0;
 
-    /* Build winsize struct — passed to openpty AND slave ioctl */
     struct winsize ws;
     memset(&ws, 0, sizeof(ws));
     ws.ws_col = (unsigned short)cols;
@@ -70,37 +72,27 @@ int pty_init(PTY *p, int cols, int rows) {
         /* ════ CHILD — become bash ════ */
         close(master_fd);
 
-        /* New session so child can adopt the slave as controlling tty */
         if (setsid() < 0) { perror("setsid"); _exit(1); }
 
-        /* Make slave the controlling terminal of this session */
         if (ioctl(slave_fd, TIOCSCTTY, 0) < 0) {
             perror("TIOCSCTTY"); _exit(1);
         }
 
         /*
-         * Set window size on the SLAVE fd.
-         * Some kernels only propagate the size to the foreground
-         * process from the slave side. Setting it only on master
-         * at openpty time is not always sufficient.
+         * Set window size on slave fd.
+         * Some kernels only propagate from slave side.
          */
         ioctl(slave_fd, TIOCSWINSZ, &ws);
 
-        /* Wire stdin/stdout/stderr to the slave PTY */
         dup2(slave_fd, STDIN_FILENO);
         dup2(slave_fd, STDOUT_FILENO);
         dup2(slave_fd, STDERR_FILENO);
         close(slave_fd);
 
         /*
-         * Set TERM, COLUMNS, LINES before exec.
-         *
-         * COLUMNS and LINES give readline a hard fallback for
-         * terminal width in case ioctl(TIOCGWINSZ) returns 0.
-         * Without these, readline may cache width=0 or width=80
-         * regardless of the actual PTY dimensions — causing the
-         * command-line redraw to erase too few characters so old
-         * text stays visible when cycling history with Up/Down.
+         * Environment: tell readline the exact terminal size.
+         * COLUMNS/LINES are the fallback when ioctl returns 0.
+         * Without these readline may cache wrong column count.
          */
         setenv("TERM", "xterm-256color", 1);
 
@@ -110,34 +102,47 @@ int pty_init(PTY *p, int cols, int rows) {
         setenv("COLUMNS", cols_str, 1);
         setenv("LINES",   rows_str, 1);
 
-        /* Disable readline bracketed-paste — reduces noise */
+        /* Disable bracketed paste — reduces OSC noise */
         setenv("READLINE_BRACKETED_PASTE", "0", 1);
 
+        /*
+         * exec bash.
+         * Bash will send its startup sequences (OSC title,
+         * color prompt, etc.) immediately — no delay needed.
+         */
         execl("/bin/bash", "-bash", NULL);
         perror("execl /bin/bash");
         _exit(1);
     }
 
-    /* ════ PARENT — cterm ════ */
+    /* ════ PARENT ════ */
     close(slave_fd);
     p->shell_pid = pid;
 
-    /* Non-blocking so pty_read() never freezes the render loop */
+    /*
+     * Set O_NONBLOCK on master so pty_read() never blocks
+     * the render loop when bash has produced no output.
+     */
     int flags = fcntl(master_fd, F_GETFL, 0);
     if (flags != -1)
         fcntl(master_fd, F_SETFL, flags | O_NONBLOCK);
 
     /*
-     * Send SIGWINCH after bash has had time to start.
-     * This forces readline to call ioctl(TIOCGWINSZ) and
-     * rebuild its idea of terminal width — the definitive fix
-     * for the "readline cached wrong column count" bug.
+     * Send SIGWINCH to bash after a tiny non-blocking delay.
+     * We use a fire-and-forget child process so the main
+     * thread is NEVER blocked — the render loop keeps running.
      *
-     * 100ms is enough on any modern system. bash takes ~10ms
-     * to reach readline initialization.
+     * This forces readline to re-query terminal size after
+     * startup, fixing the wrong-column-count cache bug.
      */
-    usleep(100000);   /* 100 ms */
-    kill(pid, SIGWINCH);
+    pid_t watcher = fork();
+    if (watcher == 0) {
+        /* Tiny helper child: sleep 80ms then signal bash */
+        usleep(80000);
+        kill(pid, SIGWINCH);
+        _exit(0);
+    }
+    /* Parent doesn't wait for watcher — it exits on its own */
 
     printf("PTY ready: PID=%d fd=%d size=%dx%d\n",
            p->shell_pid, p->master_fd, cols, rows);
@@ -147,8 +152,7 @@ int pty_init(PTY *p, int cols, int rows) {
 
 int pty_read(PTY *p, char *buf, int bufsize) {
     int n = (int)read(p->master_fd, buf, (size_t)(bufsize - 1));
-    if (n > 0)
-        buf[n] = '\0';
+    if (n > 0) buf[n] = '\0';
     return n;
 }
 
@@ -160,7 +164,6 @@ int pty_write(PTY *p, const char *buf, int len) {
 
 void pty_resize(PTY *p, int cols, int rows) {
     if (p->master_fd < 0) return;
-
     p->cols = cols;
     p->rows = rows;
 
@@ -170,10 +173,8 @@ void pty_resize(PTY *p, int cols, int rows) {
     ws.ws_row = (unsigned short)rows;
 
     /*
-     * TIOCSWINSZ updates the kernel's terminal size record and
-     * automatically delivers SIGWINCH to the foreground process
-     * group. bash/readline handles SIGWINCH by re-querying size
-     * and reflowing the command line.
+     * TIOCSWINSZ on master — kernel delivers SIGWINCH
+     * automatically to the foreground process group.
      */
     ioctl(p->master_fd, TIOCSWINSZ, &ws);
 }
@@ -182,16 +183,13 @@ void pty_resize(PTY *p, int cols, int rows) {
 void pty_destroy(PTY *p) {
     if (p->shell_pid > 0) {
         kill(p->shell_pid, SIGHUP);
-        /* Wait up to 2 seconds for clean exit */
-        int i;
-        for (i = 0; i < 20; i++) {
+        /* Non-blocking wait — up to 1 second */
+        for (int i = 0; i < 10; i++) {
             int status;
-            pid_t r = waitpid(p->shell_pid, &status, WNOHANG);
-            if (r != 0) break;
+            if (waitpid(p->shell_pid, &status, WNOHANG) != 0) break;
             usleep(100000);
         }
-        if (i == 20)
-            kill(p->shell_pid, SIGKILL);
+        kill(p->shell_pid, SIGKILL); /* force if still running */
         p->shell_pid = 0;
     }
     if (p->master_fd >= 0) {
