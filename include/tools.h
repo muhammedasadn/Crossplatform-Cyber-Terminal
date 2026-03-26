@@ -1,22 +1,35 @@
 #ifndef TOOLS_H
 #define TOOLS_H
 
+/*
+ * tools.h — Built-in tool launcher for cterm.
+ *
+ * Ctrl+P opens an overlay showing all registered tools.
+ * User can type to filter, Up/Down to navigate, Enter to launch.
+ * The list now scrolls so all tools are reachable regardless
+ * of window size.
+ */
+
 #include <SDL2/SDL.h>
+#include <stdarg.h>
 
 /* Maximum tools in the registry */
-#define MAX_TOOLS 32
+#define MAX_TOOLS     32
 
-/* Maximum arguments per tool */
+/* Maximum arguments per tool command */
 #define MAX_TOOL_ARGS 16
 
+/* How many tool rows are visible at once in the launcher */
+#define LAUNCHER_VISIBLE_ROWS 8
+
 /*
- * ToolDef — describes one registered tool.
+ * ToolDef — one registered tool entry.
  *
- * name     — shown in the launcher list (e.g. "btop")
- * desc     — one-line description shown in the launcher
- * command  — full path or name of the executable
- * args[]   — argv array passed to execvp(), NULL-terminated
- * new_tab  — 1 = open in a new tab, 0 = open in current pane
+ * name    — short label shown in the launcher list
+ * desc    — one-line description shown to the right
+ * command — executable name or full path
+ * args[]  — argv array, NULL-terminated, args[0] = command
+ * new_tab — always 1 (open in new tab)
  */
 typedef struct {
     char  name[32];
@@ -27,22 +40,25 @@ typedef struct {
 } ToolDef;
 
 /*
- * ToolLauncher — the overlay UI state.
+ * ToolLauncher — overlay UI state.
  *
- * visible     — 1 = overlay is shown on screen
- * selected    — index of currently highlighted tool
- * search[]    — text the user is typing to filter tools
- * search_len  — length of search string
+ * visible       — 1 = overlay is currently shown
+ * selected      — index within the FILTERED list (0-based)
+ * scroll_offset — first visible row in the filtered list
+ *                 selected is always kept inside the visible window
+ * search[]      — text the user has typed to filter tools
+ * search_len    — byte length of search string
  */
 typedef struct {
-    int   visible;
-    int   selected;
-    char  search[64];
-    int   search_len;
+    int  visible;
+    int  selected;
+    int  scroll_offset;   /* ← NEW: top of the visible window */
+    char search[64];
+    int  search_len;
 } ToolLauncher;
 
 /*
- * ToolManager — owns the registry and launcher state.
+ * ToolManager — owns the registry + launcher state.
  */
 typedef struct {
     ToolDef      tools[MAX_TOOLS];
@@ -50,53 +66,44 @@ typedef struct {
     ToolLauncher launcher;
 } ToolManager;
 
-/* ── API ── */
 
-/*
- * tools_init — register all built-in tools.
- * Call once at startup.
- */
+/* ── Public API ─────────────────────────────────────────────── */
+
 void tools_init(ToolManager *tm);
-
-/*
- * tools_launcher_open — show the launcher overlay.
- */
 void tools_launcher_open(ToolManager *tm);
-
-/*
- * tools_launcher_close — hide the overlay.
- */
 void tools_launcher_close(ToolManager *tm);
 
 /*
- * tools_launcher_handle_key — process a keypress while the
- * launcher is open. Returns 1 if the key was consumed.
+ * tools_launcher_handle_key — process a keypress while open.
+ * Returns 1 if the key was consumed.
  *
- * Enter   → launch selected tool
- * Escape  → close launcher
- * Up/Down → move selection
- * typing  → filter the list
+ * Enter      → launch selected tool
+ * Escape     → close
+ * Up         → move selection up  (scrolls list if needed)
+ * Down       → move selection down (scrolls list if needed)
+ * PageUp     → scroll up one full page
+ * PageDown   → scroll down one full page
+ * Backspace  → delete last search char
  */
 int  tools_launcher_handle_key(ToolManager *tm, SDL_Keycode sym,
                                 SDL_Keymod mod, void *tabmgr_ptr,
                                 int cols, int rows);
 
 /*
- * tools_launcher_handle_text — append typed character to search.
+ * tools_launcher_handle_text — append typed char to search filter.
+ * Resets selection to top when search changes.
  */
 void tools_launcher_handle_text(ToolManager *tm, const char *text);
 
 /*
  * tools_launcher_draw — render the launcher overlay.
  * Call once per frame when launcher.visible == 1.
- * Drawn on top of everything else.
  */
 void tools_launcher_draw(ToolManager *tm, SDL_Renderer *renderer,
                          void *font_ptr, int win_w, int win_h);
 
 /*
- * tools_launch — spawn a tool in a new tab.
- * Uses the existing tab + pane + PTY infrastructure.
+ * tools_launch — open a new tab and run the tool inside bash.
  */
 void tools_launch(ToolDef *tool, void *tabmgr_ptr,
                   int cols, int rows);
