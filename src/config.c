@@ -72,7 +72,7 @@ static void set_defaults(void) {
     g_config.font_antialiasing = 1;
 
     /* Colors */
-    g_config.fg_r = 200; g_config.fg_g = 200; g_config.fg_b = 200;
+    g_config.fg_r = 255; g_config.fg_g = 255; g_config.fg_b = 255;
     g_config.bg_r = 18;  g_config.bg_g = 18;  g_config.bg_b = 18;
     g_config.cursor_r = 220; g_config.cursor_g = 220; g_config.cursor_b = 220;
 
