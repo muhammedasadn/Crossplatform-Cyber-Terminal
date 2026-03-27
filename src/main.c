@@ -42,17 +42,11 @@
 
 /* ── render_pane_tree ───────────────────────────────────────── */
 /*
- * Module 11: dirty-cell optimization.
- *
- * For each cell we check cell->dirty before drawing.
- * If dirty==0 the cell hasn't changed since last frame —
- * we skip both the background rect and glyph draw calls.
- * After drawing a dirty cell we set dirty=0.
- *
- * Edge case: when scroll_offset > 0 (scrolled into history)
- * we always redraw everything because historical cells don't
- * have their dirty flags managed by the live parser.
- * This is acceptable — scrollback redraws are infrequent.
+ * The SDL backbuffer is cleared every frame in window_render_begin(),
+ * so the terminal area must also be repainted every frame. A previous
+ * dirty-cell optimization skipped unchanged cells, which made prompt
+ * text disappear on the next present even though the terminal state
+ * itself was correct.
  */
 static void render_pane_tree(Pane *p, SDL_Renderer *renderer,
                               Font *font) {
@@ -79,9 +73,6 @@ static void render_pane_tree(Pane *p, SDL_Renderer *renderer,
         pty_resize(&p->pty, pcols, prows);
     }
 
-    /* When scrolled, full redraw (dirty flags unreliable) */
-    int force_redraw = (term->scroll_offset > 0);
-
     for (int row = 0; row < term->rows; row++) {
         Cell *display_row = terminal_get_display_row(term, row);
 
@@ -91,12 +82,6 @@ static void render_pane_tree(Pane *p, SDL_Renderer *renderer,
 
             if (x + font->cell_width  > r.x + r.w) continue;
             if (y + font->cell_height > r.y + r.h) continue;
-
-            /* ── Dirty cell check (Module 11) ── */
-            if (!force_redraw && display_row &&
-                !display_row[col].dirty) {
-                continue;   /* unchanged — skip this cell */
-            }
 
             Uint8 bg_r = g_config.bg_r;
             Uint8 bg_g = g_config.bg_g;
