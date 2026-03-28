@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=cterm
+Comment=GPU-accelerated terminal emulator
+Exec=cterm
+Icon=cterm
+Type=Application
+Categories=System;TerminalEmulator;
+Keywords=terminal;shell;bash;
+StartupNotify=true
