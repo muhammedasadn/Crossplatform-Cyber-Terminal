@@ -64,3 +64,15 @@ target_compile_options(cterm PRIVATE
     -Wno-implicit-function-declaration
     -g
 )
+
+target_compile_options(cterm PRIVATE
+    -O2
+    -D_FORTIFY_SOURCE=2
+    -fstack-protector-strong
+    -Wformat
+    -Wformat-security
+)
+target_link_options(cterm PRIVATE
+    -Wl,-z,relro
+    -Wl,-z,now
+)
