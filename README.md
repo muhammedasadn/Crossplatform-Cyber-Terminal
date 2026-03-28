@@ -308,7 +308,7 @@ MIT License — see [LICENSE](LICENSE) for details.
 ## Author
 
 **Muhammed Asad**
-- GitHub: [@yourusername](https://github.com/yourusername)
+- GitHub: [@yourusername](https://github.com/muhammedasadn)
 - Website: [your-cterm-website.com](https://your-cterm-website.com)
 
 ---
