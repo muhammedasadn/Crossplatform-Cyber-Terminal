@@ -1,4 +1,17 @@
 build/
+build-release/
+*.AppImage
+
+# Local Codex/session artifacts
+.codex
+
+# AppImage build outputs
+AppDir.backup/
+AppDir/*
+!AppDir/.DirIcon
+!AppDir/AppRun
+!AppDir/cterm.desktop
+!AppDir/cterm.png
 
 # Common editor/OS noise
 .DS_Store
