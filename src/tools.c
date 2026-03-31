@@ -210,6 +210,34 @@ static int get_filtered(ToolManager *tm, const char *search,
     return count;
 }
 
+static void copy_clamped_label(char *dst, size_t dst_size,
+                               const char *src, int max_chars) {
+    if (dst_size == 0) {
+        return;
+    }
+
+    dst[0] = '\0';
+    if (!src || max_chars <= 0) {
+        return;
+    }
+
+    size_t limit = (size_t)max_chars;
+    if (limit >= dst_size) {
+        limit = dst_size - 1;
+    }
+
+    size_t src_len = strlen(src);
+    size_t copy_len = src_len < limit ? src_len : limit;
+    memcpy(dst, src, copy_len);
+    dst[copy_len] = '\0';
+
+    if (src_len > copy_len && copy_len >= 3) {
+        dst[copy_len - 3] = '.';
+        dst[copy_len - 2] = '.';
+        dst[copy_len - 1] = '.';
+    }
+}
+
 static void ensure_visible(ToolLauncher *launcher, int count) {
     if (count == 0) {
         launcher->scroll_offset = 0;
@@ -453,15 +481,7 @@ void tools_launcher_draw(ToolManager *tm, SDL_Renderer *renderer,
         int available = (overlay_w - (desc_x - ox) - 14) / cw;
         if (available > 0) {
             char desc[80] = {0};
-            int desc_len = (int)strlen(tool->desc);
-            strncpy(desc, tool->desc,
-                    desc_len < available ? (size_t)desc_len : (size_t)available);
-            if (desc_len > available && available > 3) {
-                desc[available - 3] = '.';
-                desc[available - 2] = '.';
-                desc[available - 1] = '.';
-                desc[available] = '\0';
-            }
+            copy_clamped_label(desc, sizeof(desc), tool->desc, available);
 
             Uint8 desc_r = is_selected ? RT_SEL_FG_R : RT_DIM_R + 30;
             Uint8 desc_g = is_selected ? RT_SEL_FG_G : RT_DIM_G + 30;
@@ -527,8 +547,8 @@ void tools_launcher_draw(ToolManager *tm, SDL_Renderer *renderer,
                          label_x, py, RT_DIM_R + 20, RT_DIM_G + 20, RT_DIM_B);
         int short_available = (overlay_w - (value_x - ox) - 14) / cw;
         char short_desc[64] = {0};
-        strncpy(short_desc, selected->desc,
-                short_available < 63 ? (size_t)short_available : 63);
+        copy_clamped_label(short_desc, sizeof(short_desc),
+                           selected->desc, short_available);
         font_draw_string(font, renderer, short_desc,
                          value_x, py, RT_DIM_R + 50, RT_DIM_G + 50, RT_DIM_B);
         py += ch + 6;
